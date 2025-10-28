@@ -3,3 +3,6 @@ uvicorn[standard]==0.30.6
 autogen-agentchat==0.7.5
 autogen-ext==0.7.5
 openai==1.52.2
+tiktoken
+httpx
+pydantic-settings
