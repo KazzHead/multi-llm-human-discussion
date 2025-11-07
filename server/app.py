@@ -1,5 +1,5 @@
 # server/app.py
-from typing import Dict
+from typing import Dict, List, Optional
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,7 +7,7 @@ from pydantic import BaseModel
 import json
 import asyncio
 
-from server.autogen_session import Session
+from server.autogen_session import Session, TRAVELER_ROLES
 
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
@@ -30,6 +30,8 @@ app.add_middleware(
 # --- 入力モデル ---
 class CreateSessionIn(BaseModel):
     session_id: str
+    ai_travelers: Optional[List[str]] = None
+    wishes_md: Optional[str] = None
 
 class PostInputIn(BaseModel):
     session_id: str
@@ -45,13 +47,23 @@ async def create_session(payload: CreateSessionIn, bg: BackgroundTasks):
     if not session_id:
         raise HTTPException(400, "session_id required")
     if session_id in SESS:
-        return {"ok": True, "started": bool(SESS[session_id]._run_task)}
+        session = SESS[session_id]
+        return {
+            "ok": True,
+            "started": bool(session._run_task),
+            "config": session.get_config(),
+        }
 
-    session = Session()
+    ai_travelers = payload.ai_travelers or []
+    invalid = [r for r in ai_travelers if r not in TRAVELER_ROLES]
+    if invalid:
+        raise HTTPException(400, f"invalid traveler ids: {invalid}")
+
+    session = Session(ai_travelers=ai_travelers, wishes_md=payload.wishes_md)
     SESS[session_id] = session
-    bg.add_task(session.stream_run) 
+    bg.add_task(session.stream_run)
     # session._run_task = asyncio.create_task(session.stream_run())
-    return {"ok": True, "started": True}
+    return {"ok": True, "started": True, "config": session.get_config()}
 
 @app.get("/session/stream")
 async def stream(session_id: str):
@@ -108,9 +120,15 @@ async def post_input(payload: PostInputIn):
     text = payload.text
     if session_id not in SESS:
         raise HTTPException(404, "no session")
-    if who not in ("traveler_B", "traveler_D"):
-        raise HTTPException(400, "who must be traveler_B or traveler_D")
-    SESS[session_id].hio.feed(who, text)
+    if who not in TRAVELER_ROLES:
+        raise HTTPException(400, "invalid traveler")
+    session = SESS[session_id]
+    if session.is_ai_traveler(who):
+        raise HTTPException(400, f"{who} is AI-controlled")
+    try:
+        session.hio.feed(who, text)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     return {"ok": True}
 
 @app.get("/session/log")
@@ -119,6 +137,13 @@ async def get_log(session_id: str):
         raise HTTPException(404, "no session")
     md = SESS[session_id].get_log_markdown()
     return PlainTextResponse(md)
+
+
+@app.get("/session/config")
+async def get_session_config(session_id: str):
+    if session_id not in SESS:
+        raise HTTPException(404, "no session")
+    return SESS[session_id].get_config()
 
 @app.get("/healthz")
 def healthz():
