@@ -119,3 +119,7 @@ async def get_log(session_id: str):
         raise HTTPException(404, "no session")
     md = SESS[session_id].get_log_markdown()
     return PlainTextResponse(md)
+
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
