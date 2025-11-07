@@ -20,8 +20,8 @@ type Speaker = Role | "moderator";
 
 const DEFAULT_TURN_ORDER: Speaker[] = ["moderator", ...TRAVELER_ROLES];
 
-// const API_BASE = `http://${window.location.hostname}:8000`;
-const API_BASE = "https://multi-llm-human-discussion.onrender.com";
+const API_BASE = `http://${window.location.hostname}:8000`;
+// const API_BASE = "https://multi-llm-human-discussion.onrender.com";
 
 function nextSpeaker(order: Speaker[], after: Speaker): Speaker {
   if (order.length === 0) return after;

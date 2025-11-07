@@ -38,6 +38,9 @@ class PostInputIn(BaseModel):
     who: str           # "traveler_B" or "traveler_D"
     text: str
 
+class StopSessionIn(BaseModel):
+    session_id: str
+
 # --- メモリ上にセッションを保持（簡易実装） ---
 SESS: Dict[str, Session] = {}
 
@@ -61,7 +64,14 @@ async def create_session(payload: CreateSessionIn, bg: BackgroundTasks):
 
     session = Session(ai_travelers=ai_travelers, wishes_md=payload.wishes_md)
     SESS[session_id] = session
-    bg.add_task(session.stream_run)
+    # Prefer Session.start if available; fallback to BackgroundTasks
+    try:
+        if hasattr(session, "start"):
+            session.start()  # type: ignore[attr-defined]
+        else:
+            bg.add_task(session.stream_run)
+    except Exception:
+        bg.add_task(session.stream_run)
     # session._run_task = asyncio.create_task(session.stream_run())
     return {"ok": True, "started": True, "config": session.get_config()}
 
@@ -144,6 +154,36 @@ async def get_session_config(session_id: str):
     if session_id not in SESS:
         raise HTTPException(404, "no session")
     return SESS[session_id].get_config()
+
+@app.get("/session/list")
+async def list_sessions():
+    items = []
+    for sid, sess in SESS.items():
+        try:
+            started = bool(getattr(sess, "started", True)) or True
+        except Exception:
+            started = True
+        items.append({
+            "id": sid,
+            "started": started,
+            "config": sess.get_config(),
+        })
+    return {"sessions": items}
+
+@app.post("/session/stop")
+async def stop_session(payload: StopSessionIn):
+    sid = payload.session_id
+    if sid not in SESS:
+        raise HTTPException(404, "no session")
+    sess = SESS.pop(sid)
+    try:
+        if hasattr(sess, "stop"):
+            await sess.stop()  # type: ignore[attr-defined]
+        else:
+            sess.broadcast({"type": "__END__"})
+    except Exception:
+        pass
+    return {"ok": True}
 
 @app.get("/healthz")
 def healthz():
