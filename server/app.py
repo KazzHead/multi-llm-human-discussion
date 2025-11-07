@@ -11,7 +11,7 @@ from server.autogen_session import Session
 
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
-    "https://multi-llm-human-discussion.vercel.app/",
+    "https://multi-llm-human-discussion.vercel.app",
 ]
 
 SESS: Dict[str, Session] = {}
