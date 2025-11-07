@@ -120,7 +120,7 @@ class Session:
         agentD = UserProxyAgent(name="traveler_D", input_func=self._input_func_D)
 
         # 終了条件・順序（司会→A→B→C→D→…）
-        termination = TextMentionTermination("【合意確定】") | MaxMessageTermination(50)
+        termination = MaxMessageTermination(1000)
         team = RoundRobinGroupChat([moderator, agentA, agentB, agentC, agentD],termination_condition=termination)
         self._team = team
 
