@@ -1,32 +1,40 @@
 "use client";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "next/navigation";
-import type { Role, ChatMessage, SSEEvent } from "@/app/types";
+import {
+  type Role,
+  type ChatMessage,
+  type SSEEvent,
+  type SessionConfig,
+  TRAVELER_ROLES,
+} from "@/app/types";
 
-const TURN_ORDER = [
-  "moderator",
-  "traveler_A",
-  "traveler_B",
-  "traveler_C",
-  "traveler_D",
-] as const;
+const TRAVELER_LABELS: Record<Role, string> = {
+  traveler_A: "旅行者A",
+  traveler_B: "旅行者B",
+  traveler_C: "旅行者C",
+  traveler_D: "旅行者D",
+};
 
-// const API_BASE = `http://${window.location.hostname}:8000`;
-const API_BASE = "https://multi-llm-human-discussion.onrender.com";
+type Speaker = Role | "moderator";
 
-type Speaker = (typeof TURN_ORDER)[number];
+const DEFAULT_TURN_ORDER: Speaker[] = ["moderator", ...TRAVELER_ROLES];
 
-function nextSpeaker(after: Speaker): Speaker {
-  const i = TURN_ORDER.indexOf(after);
-  const j = (i + 1) % TURN_ORDER.length;
-  return TURN_ORDER[j];
+const API_BASE = `http://${window.location.hostname}:8000`;
+// const API_BASE = "https://multi-llm-human-discussion.onrender.com";
+
+function nextSpeaker(order: Speaker[], after: Speaker): Speaker {
+  if (order.length === 0) return after;
+  const i = order.indexOf(after);
+  const nextIndex = i >= 0 ? (i + 1) % order.length : 0;
+  return order[nextIndex];
 }
 
-function guessNextSpeaker(messages: ChatMessage[]): Speaker {
-  // まだ何も来てなければ最初は moderator から開始する前提
-  if (messages.length === 0) return "moderator";
+function guessNextSpeaker(order: Speaker[], messages: ChatMessage[]): Speaker {
+  if (order.length === 0) return "moderator";
+  if (messages.length === 0) return order[0];
   const last = messages[messages.length - 1].who as Speaker;
-  return nextSpeaker(last);
+  return nextSpeaker(order, last);
 }
 
 export default function Room() {
@@ -34,7 +42,11 @@ export default function Room() {
   const rawId = params?.id;
   const sessionId = Array.isArray(rawId) ? rawId[0] : rawId;
 
-  const [role, setRole] = useState<Role>("traveler_B");
+  const [turnOrder, setTurnOrder] = useState<Speaker[]>(DEFAULT_TURN_ORDER);
+  const [role, setRole] = useState<Role | null>(null);
+  const [sessionConfig, setSessionConfig] = useState<SessionConfig | null>(
+    null
+  );
   const [msgs, setMsgs] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const sseRef = useRef<EventSource | null>(null);
@@ -43,9 +55,59 @@ export default function Room() {
   const [typingMap, setTypingMap] = useState<Record<string, boolean>>({});
   const [finished, setFinished] = useState(false);
 
-  const [isTyping, setIsTyping] = useState(false);
+  const humanRoles = useMemo<Role[]>(() => {
+    if (sessionConfig) return sessionConfig.human_travelers;
+    return ["traveler_B", "traveler_D"];
+  }, [sessionConfig]);
 
-  // SSE接続
+  useEffect(() => {
+    if (!sessionId) return;
+    let aborted = false;
+    const loadConfig = async () => {
+      try {
+        const res = await fetch(
+          `${API_BASE}/session/config?session_id=${encodeURIComponent(
+            sessionId
+          )}`
+        );
+        if (!res.ok) throw new Error("failed to load config");
+        const data = (await res.json()) as SessionConfig;
+        if (!aborted) {
+          setSessionConfig(data);
+          setTurnOrder(DEFAULT_TURN_ORDER);
+        }
+      } catch {
+        if (!aborted) {
+          setSessionConfig({
+            ai_travelers: TRAVELER_ROLES.filter(
+              (t) => !["traveler_B", "traveler_D"].includes(t)
+            ),
+            human_travelers: ["traveler_B", "traveler_D"],
+          });
+          setTurnOrder(DEFAULT_TURN_ORDER);
+        }
+      }
+    };
+    loadConfig();
+    return () => {
+      aborted = true;
+    };
+  }, [sessionId]);
+
+  useEffect(() => {
+    setRole((prev) => {
+      if (prev && TRAVELER_ROLES.includes(prev)) return prev;
+      return humanRoles[0] ?? TRAVELER_ROLES[0] ?? null;
+    });
+  }, [humanRoles]);
+
+  useEffect(() => {
+    if (!role) {
+      setInput("");
+    }
+  }, [role]);
+
+  // SSE 接続
   useEffect(() => {
     if (!sessionId || sseRef.current) return;
     const es = new EventSource(
@@ -69,7 +131,6 @@ export default function Room() {
             { who: ev.who, content: ev.content, ts: Date.now() },
           ]);
           if (ev.content.trim() === "【合意確定】") setFinished(true);
-          // 話した人は typing を下げておく（保険）
           setTypingMap((m) => ({ ...m, [ev.who]: false }));
         } else if (ev.type === "typing") {
           setTypingMap((m) => ({ ...m, [ev.who]: ev.active }));
@@ -98,7 +159,7 @@ export default function Room() {
 
   const typingTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sendTyping = (active: boolean) => {
-    if (!sessionId) return;
+    if (!sessionId || !role) return;
     fetch(`${API_BASE}/session/typing`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -106,26 +167,44 @@ export default function Room() {
     }).catch(() => {});
   };
 
-  const myAgentName: Speaker = role; // B か D
-  const currentNext: Speaker = useMemo(() => guessNextSpeaker(msgs), [msgs]);
-  const isMyTurn = currentNext === myAgentName;
+  const myAgentName = role;
+  const currentNext: Speaker = useMemo(
+    () => guessNextSpeaker(turnOrder, msgs),
+    [turnOrder, msgs]
+  );
+  const isMyTurn = role ? currentNext === role : false;
+  const isSelectedAi = useMemo(() => {
+    if (!role) return false;
+    if (sessionConfig) return sessionConfig.ai_travelers.includes(role);
+    return ["traveler_A", "traveler_C"].includes(role);
+  }, [role, sessionConfig]);
 
   const onInputChange: React.ChangeEventHandler<HTMLTextAreaElement> = (e) => {
     const el = e.currentTarget;
     setInput(el.value);
 
-    // 入力中フラグ（300msデバウンス）
+    // 入力中フラグ（800ms デバウンス）
     if (typingTimer.current) clearTimeout(typingTimer.current);
-    sendTyping(true);
-    typingTimer.current = setTimeout(() => sendTyping(false), 800);
+    if (role && !isSelectedAi) {
+      sendTyping(true);
+      typingTimer.current = setTimeout(() => sendTyping(false), 800);
+    }
 
     // 自動リサイズ
     el.style.height = "auto";
-    el.style.height = Math.min(el.scrollHeight, 240) + "px"; // 上限240px
+    el.style.height = Math.min(el.scrollHeight, 240) + "px";
   };
 
   const send = async () => {
-    if (!sessionId || !input.trim() || !isMyTurn || finished) return;
+    if (
+      !sessionId ||
+      !role ||
+      !input.trim() ||
+      !isMyTurn ||
+      finished ||
+      isSelectedAi
+    )
+      return;
     await fetch(`${API_BASE}/session/input`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -136,7 +215,6 @@ export default function Room() {
       }),
     });
     setInput("");
-    // 高さリセット
     const ta = document.getElementById(
       "chat-input"
     ) as HTMLTextAreaElement | null;
@@ -167,15 +245,21 @@ export default function Room() {
         }}
       >
         <div style={{ fontWeight: 700, flex: 1 }}>Room: {sessionId}</div>
-        <div style={{ display: "flex", gap: 8 }}>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
           <label>役割</label>
           <select
-            value={role}
-            onChange={(e) => setRole(e.target.value as Role)}
+            value={role ?? ""}
+            onChange={(e) => {
+              const value = e.target.value as Role | "";
+              if (value) setRole(value as Role);
+            }}
             style={{ padding: "6px 8px" }}
           >
-            <option value="traveler_B">旅行者B（自分）</option>
-            <option value="traveler_D">旅行者D（自分）</option>
+            {TRAVELER_ROLES.map((r) => (
+              <option key={r} value={r}>
+                {TRAVELER_LABELS[r]}
+              </option>
+            ))}
           </select>
         </div>
       </header>
@@ -190,13 +274,13 @@ export default function Room() {
         }}
       >
         {msgs.map((m, i) => {
-          const mine = m.who === myAgentName;
+          const mine = role ? m.who === myAgentName : false;
           const nameMap: Record<string, string> = {
             moderator: "司会",
-            traveler_A: "旅行者A",
-            traveler_B: "旅行者B",
-            traveler_C: "旅行者C",
-            traveler_D: "旅行者D",
+            ...TRAVELER_ROLES.reduce(
+              (acc, key) => ({ ...acc, [key]: TRAVELER_LABELS[key] }),
+              {} as Record<string, string>
+            ),
           };
           return (
             <div
@@ -222,7 +306,7 @@ export default function Room() {
                     flex: "0 0 auto",
                   }}
                 >
-                  {nameMap[m.who]?.replace("旅行者", "旅")}
+                  {nameMap[m.who] ?? m.who}
                 </div>
               )}
               <div
@@ -254,26 +338,6 @@ export default function Room() {
         })}
       </div>
 
-      {/* 入力中インジケータ
-      <div style={{ padding: "4px 12px", color: "#6b7280", fontSize: 12 }}>
-        {Object.entries(typingMap)
-          .filter(([who, active]) => active && who !== myAgentName)
-          .map(([who]) => {
-            const nameMap: Record<string, string> = {
-              moderator: "司会",
-              traveler_A: "旅行者A",
-              traveler_B: "旅行者B",
-              traveler_C: "旅行者C",
-              traveler_D: "旅行者D",
-            };
-            return (
-              <span key={who} style={{ marginRight: 12 }}>
-                {nameMap[who] ?? who} が入力中…
-              </span>
-            );
-          })}
-      </div> */}
-
       {/* 入力欄 */}
       <div
         style={{
@@ -291,29 +355,43 @@ export default function Room() {
             value={input}
             onChange={onInputChange}
             onBlur={() => sendTyping(false)}
-            placeholder={"ここにメッセージを入力"}
-            rows={1}
             style={{
               width: "100%",
-              resize: "none", // ← ユーザによるドラッグリサイズ禁止
+              resize: "none",
               padding: 12,
               borderRadius: 8,
-              border: "1px solid #ddd",
+              border:
+                role && isMyTurn && !finished
+                  ? "1px solid #10b981"
+                  : "1px solid #ddd",
               outline: "none",
-              overflowY: "auto", // ← スクロール可
+              overflowY: "auto",
               maxHeight: "240px",
+              backgroundColor:
+                !role || finished || !isMyTurn || isSelectedAi
+                  ? "#f5f5f5"
+                  : "#fff",
             }}
           />
         </div>
         <button
           onClick={send}
-          disabled={!isMyTurn || !input.trim()}
+          disabled={
+            !role || finished || !isMyTurn || !input.trim() || isSelectedAi
+          }
           style={{
             borderRadius: 8,
             border: "1px solid #10b981",
-            background: isMyTurn && input.trim() ? "#10b981" : "#a7f3d0",
+            background:
+              role && isMyTurn && !finished && input.trim() && !isSelectedAi
+                ? "#10b981"
+                : "#a7f3d0",
             color: "#fff",
             fontWeight: 700,
+            cursor:
+              role && isMyTurn && !finished && input.trim() && !isSelectedAi
+                ? "pointer"
+                : "not-allowed",
           }}
         >
           送信
@@ -329,17 +407,11 @@ export default function Room() {
           }}
         >
           <span>
-            次の番：
+            次の番:{" "}
             <b>
               {currentNext === "moderator"
                 ? "司会"
-                : currentNext === "traveler_A"
-                ? "旅行者A"
-                : currentNext === "traveler_B"
-                ? "旅行者B"
-                : currentNext === "traveler_C"
-                ? "旅行者C"
-                : "旅行者D"}
+                : TRAVELER_LABELS[currentNext as Role] ?? currentNext}
             </b>
           </span>
           <a
