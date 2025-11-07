@@ -1,6 +1,6 @@
 # server/app.py
 from typing import Dict
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -40,7 +40,7 @@ class PostInputIn(BaseModel):
 SESS: Dict[str, Session] = {}
 
 @app.post("/session/create")
-async def create_session(payload: CreateSessionIn):
+async def create_session(payload: CreateSessionIn, bg: BackgroundTasks):
     session_id = payload.session_id
     if not session_id:
         raise HTTPException(400, "session_id required")
@@ -49,7 +49,8 @@ async def create_session(payload: CreateSessionIn):
 
     session = Session()
     SESS[session_id] = session
-    session._run_task = asyncio.create_task(session.stream_run())
+    bg.add_task(session.stream_run) 
+    # session._run_task = asyncio.create_task(session.stream_run())
     return {"ok": True, "started": True}
 
 @app.get("/session/stream")
@@ -60,21 +61,30 @@ async def stream(session_id: str):
     listener = session.add_listener()
 
     async def sse():
-        # まず履歴を送る（新規参加者も同じ会話を再現）
         for who, content in session.messages:
             yield f"data: {json.dumps({'type':'message','who':who,'content':content}, ensure_ascii=False)}\n\n"
-        # 以後はライブ配信
         try:
             while True:
-                ev = await listener.get()
-                if ev.get("type") == "__END__":
-                    yield "data: __END__\n\n"
-                    break
-                yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                try:
+                    ev = await asyncio.wait_for(listener.get(), timeout=15)
+                    if ev.get("type") == "__END__":
+                        yield "data: __END__\n\n"
+                        break
+                    yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"  # 心拍（コメント）
         finally:
             session.remove_listener(listener)
 
-    return StreamingResponse(sse(), media_type="text/event-stream")
+    return StreamingResponse(
+        sse(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 class TypingIn(BaseModel):
     session_id: str

@@ -91,6 +91,7 @@ class Session:
         self.typing_q.put_nowait({"type": "typing", "who": who, "active": bool(active)})
 
     async def stream_run(self):  # -> AsyncIterator[tuple[str, str]]
+        self.broadcast({"type":"message","who":"system","content":"session started"})
         # モデルクライアント
         moderator_mc = OpenAIChatCompletionClient(model=self.model_mod_name)
         agent_mc = OpenAIChatCompletionClient(model=self.model_agent_name)
@@ -156,14 +157,18 @@ class Session:
                 pass
             return default
 
-        # ストリーム実行（型に依存せず content があるものだけ流す）
-        async for ev in team.run_stream(task=task):
-            who = pick(ev, "source", "name", default="system")
-            content = pick(ev, "content", default=None)
-            if content:
-                self.messages.append((who, content))
-                self.broadcast({"type": "message", "who": who, "content": content})
-        self.broadcast({"type": "__END__"})
+        try:
+            # ストリーム実行（型に依存せず content があるものだけ流す）
+            async for ev in team.run_stream(task=task):
+                who = pick(ev, "source", "name", default="system")
+                content = pick(ev, "content", default=None)
+                if content:
+                    self.messages.append((who, content))
+                    self.broadcast({"type": "message", "who": who, "content": content})
+            self.broadcast({"type": "__END__"})
+        except Exception as e:
+            self.broadcast({"type":"message","who":"system","content":f"error: {e!r}"})
+            raise
 
         await agent_mc.close()
 
