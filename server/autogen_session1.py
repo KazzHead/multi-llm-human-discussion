@@ -3,8 +3,9 @@ from typing import Dict, List, Tuple, Optional, TypedDict
 from datetime import datetime, timezone, timedelta
 from autogen_agentchat.agents import AssistantAgent, UserProxyAgent
 from autogen_agentchat.teams import RoundRobinGroupChat
-from autogen_agentchat.conditions import MaxMessageTermination, TextMentionTermination
+from autogen_agentchat.conditions import MaxMessageTermination
 from autogen_ext.models.openai import OpenAIChatCompletionClient
+from autogen_agentchat.conditions import MaxMessageTermination, TextMentionTermination
 from autogen_agentchat.messages import TextMessage
 
 
@@ -77,7 +78,7 @@ DEFAULT_WISHES_TEXT = """.;]:
 """.strip()
 
 # === ユーティリティ ===
-# --- Wishes 型（公開/非公開の箇条書き）---
+ # --- Wishes 型（公開/非公開の箇条書き）---
 class WishesSplit(TypedDict, total=False):
     public: List[str]
     private: List[str]
@@ -244,48 +245,72 @@ class Session:
         self.typing_q.put_nowait({"type": "typing", "who": who, "active": bool(active)})
 
     async def stream_run(self):  # -> AsyncIterator[tuple[str, str]]
-        self.broadcast({"type": "message", "who": "system", "content": "session started"})
-
-        # モデルクライアント（trial 間で再利用）
+        self.broadcast({"type":"message","who":"system","content":"session started"})
+        # モデルクライアント
         moderator_mc = OpenAIChatCompletionClient(model=self.model_mod_name)
         agent_mc = OpenAIChatCompletionClient(model=self.model_agent_name)
 
-        # 旅行者ソース名と賛成キーワード（main.py と同様の合意判定ロジック）
-        TRAVELER_SOURCES = set(self.travelers)
-        AGREE_KEYWORDS = [
-            "賛成", "同意", "了承", "この案でいい", "この案で良い", "問題ない", "異論ありません"
-        ]
+        # 司会
+        moderator = AssistantAgent(
+            name="moderator",
+            system_message=(
+            f"あなたは旅行計画会議の司会者です。参加者は旅行者A,旅行者B,旅行者C,旅行者Dの4名です。\n"
+            "【役割】\n"
+            "- 各旅行者の意見を公平に引き出し、自然言語のみで合意形成を進める。\n"
+            "【ルール】\n"
+            "- 発言は自動的に 司会→各旅行者(順番)→司会→… の順で進む。\n"
+            "- 旅行者A〜Dの発言をあなたが作ってはいけない。\n"
+            "- 交渉では表・図・PDF・CSV・数値資料などの外部ファイルは使用しない。\n"
+            "- 本会議は『口頭合意の形成』のみを扱い、外部作業（予約・問い合わせ・見積・資料収集）、"
+            "  役割分担、提出期限・締切の提示を一切行わない。\n"
+            "【合意の扱い】\n"
+            "- 各旅行者が明確に『賛成』『同意』『了承』などの語で最終案への同意を表明した場合のみ、"
+            "  そのタイミングであなたはテキスト中に必ず『【合意確定】』という語を含めること。\n"
+            "- 合意が確定したときのあなたの最終発話には、以下を必ず含めること：\n"
+            "  1) メッセージの最初の行に『【合意確定】』という語だけ書き、\n"
+            "  2) 続けて、『【最終合意プラン】』から始まる、合意した2泊3日の旅行プラン全文の要約\n"
+            "     （行き先・各日の大まかな行程・宿泊・食事・予算の目安などを日本語で整理する）\n"
+            "- 『【最終合意プラン】』は1つのメッセージの中に書き、別メッセージには分割しない。\n"
+            "【論点】\n"
+            "- 交通手段\n"
+            "- 出発時間\n"
+            "- 体力・身体的制約\n"
+            "- 費用・予算\n"
+            "- 食事・グルメ\n"
+            "- 観光スタイル・嗜好\n"
+            "- その他\n"
+            "※日程は確定しているものとし、議論しない。\n"
+            "【注意】\n"
+            "【ルール】や【合意の扱い】を復唱したり、参加者に説明したりしないこと。\n"
+            ),
+            model_client=moderator_mc,
+        )
 
-        # has_valid_consensus: main.py のロジックを Session 用に移植
-        def has_valid_consensus(raw_messages) -> bool:
-            """
-            TextMessage 群から「本物の合意確定メッセージ」があるか判定。
-            条件:
-            - source == 'moderator' のメッセージで、
-              先頭行が『【合意確定】』で始まり、かつ同じメッセージ内に『【最終合意プラン】』を含む
-            - そのメッセージより前に、全ての TRAVELER_SOURCES が賛成キーワードを含む発話をしている
-            """
-            agree_index: Optional[int] = None
+        participants = [moderator]
+        for traveler in self.travelers:
+            if traveler in self.ai_travelers:
+                participants.append(
+                    AssistantAgent(
+                        name=traveler,
+                        system_message=self._system_message_for_with_wishes(traveler),
+                        model_client=agent_mc,
+                    )
+                )
+            else:
+                participants.append(
+                    UserProxyAgent(name=traveler, input_func=self._input_funcs[traveler])
+                )
 
-            for idx, m in enumerate(raw_messages):
-                if isinstance(m, TextMessage) and m.source == "moderator":
-                    text = m.content or ""
-                    stripped = text.lstrip()
-                    if stripped.startswith("【合意確定】") and "【最終合意プラン】" in stripped:
-                        agree_index = idx
-                        break
+        # 終了条件・順序（司会→A→B→C→D→…）
+        termination = MaxMessageTermination(1000)
+        team = RoundRobinGroupChat(participants, termination_condition=termination)
+        self._team = team
 
-            if agree_index is None:
-                return False
-
-            agreed: Dict[str, bool] = {src: False for src in TRAVELER_SOURCES}
-            for m in raw_messages[:agree_index]:
-                if isinstance(m, TextMessage) and m.source in agreed:
-                    text = m.content or ""
-                    if any(kw in text for kw in AGREE_KEYWORDS):
-                        agreed[m.source] = True
-
-            return all(agreed.values())
+        task = (
+            "あなたたちは4人の旅行者と司会。1泊2日の国内旅行計画を合意。"
+            "できるだけ詳細に予算と各日程をまとめてください。"
+            "話し合いを開始。"
+        )
 
         # イベントから値を安全に取り出すヘルパ
         def pick(obj, *keys, default=None):
@@ -314,130 +339,21 @@ class Session:
                 pass
             return default
 
-        # trial 関連設定（main.py に合わせる）
-        num_travelers = len(self.travelers)
-        MAX_MESSAGES_PER_TRIAL = 12 * (num_travelers + 1) + 1
-        MAX_RETRIES = 3  # 「やり直し3回まで」= 最大4試行
-
         try:
-            # 再試行付き multi-run
-            for trial in range(1, MAX_RETRIES + 2):  # 1..(MAX_RETRIES+1)
-                # trial 開始通知
-                self.broadcast({
-                    "type": "message",
-                    "who": "system",
-                    "content": f"trial {trial} started",
-                })
-
-                # 司会 system message
-                traveler_names_ja = [TRAVELER_LABELS.get(t, t) for t in self.travelers]
-                traveler_list_str = "、".join(traveler_names_ja)
-                moderator_system_message = (
-                    f"あなたは旅行計画会議の司会者です。参加者は {traveler_list_str} の計{num_travelers}名です。\n"
-                    "【役割】\n"
-                    "- 各旅行者の意見を公平に引き出し、自然言語のみで合意形成を進める。\n"
-                    "【ルール】\n"
-                    "- 発言は自動的に 司会→各旅行者(順番)→司会→… の順で進む。\n"
-                    "- 旅行者A〜Dの発言をあなたが作ってはいけない。\n"
-                    "- 交渉では表・図・PDF・CSV・数値資料などの外部ファイルは使用しない。\n"
-                    "- 本会議は『口頭合意の形成』のみを扱い、外部作業（予約・問い合わせ・見積・資料収集）、"
-                    "  役割分担、提出期限・締切の提示を一切行わない。\n"
-                    "【合意の扱い】\n"
-                    "- 各旅行者が明確に『賛成』『同意』『了承』などの語で最終案への同意を表明した場合のみ、"
-                    "  そのタイミングであなたはテキスト中に必ず『【合意確定】』という語を含めること。\n"
-                    "- 合意が確定したときのあなたの最終発話には、以下を必ず含めること：\n"
-                    "  1) メッセージの最初の行に『【合意確定】』という語だけ書き、\n"
-                    "  2) 続けて、『【最終合意プラン】』から始まる、合意した1泊2日の旅行プラン全文の要約\n"
-                    "     （行き先・各日の大まかな行程・宿泊・食事などを日本語で整理する）\n"
-                    "- 『【最終合意プラン】』は1つのメッセージの中に書き、別メッセージには分割しない。\n"
-                    "【論点】\n"
-                    "- 交通手段\n"
-                    "- 出発時間\n"
-                    "- 体力・身体的制約\n"
-                    "- 食事・グルメ\n"
-                    "- 観光スタイル・嗜好\n"
-                    "- その他\n"
-                    "※日程は1泊2日として固定されているものとし、日数自体は議論しない。\n"
-                    "【注意】\n"
-                    "【ルール】や【合意の扱い】を復唱したり、参加者に説明したりしないこと。\n"
-                )
-
-                # 司会
-                moderator = AssistantAgent(
-                    name="moderator",
-                    system_message=moderator_system_message,
-                    model_client=moderator_mc,
-                )
-
-                participants = [moderator]
-                for traveler in self.travelers:
-                    if traveler in self.ai_travelers:
-                        participants.append(
-                            AssistantAgent(
-                                name=traveler,
-                                system_message=self._system_message_for_with_wishes(traveler),
-                                model_client=agent_mc,
-                            )
-                        )
-                    else:
-                        participants.append(
-                            UserProxyAgent(name=traveler, input_func=self._input_funcs[traveler])
-                        )
-
-                # 終了条件：TextMentionTermination + MaxMessageTermination
-                termination = (
-                    TextMentionTermination("【合意確定】\n")
-                    | MaxMessageTermination(MAX_MESSAGES_PER_TRIAL)
-                )
-                team = RoundRobinGroupChat(participants, termination_condition=termination)
-                self._team = team
-
-                task = (
-                    "あなたたちは4人の旅行者と司会です。1泊2日の国内旅行計画を合意してください。"
-                    "それぞれの希望条件を踏まえ、最終的にはできるだけ具体的に各日の行程と宿泊・食事の内容をまとめてください。"
-                    "話し合いを開始してください。"
-                )
-
-                raw_messages: List[TextMessage] = []
-
-                # ストリーム実行
-                async for ev in team.run_stream(task=task):
-                    if isinstance(ev, TextMessage):
-                        raw_messages.append(ev)
-
-                    who = pick(ev, "source", "name", default="system")
-                    content = pick(ev, "content", default=None)
-                    if content:
-                        self.messages.append((who, content))
-                        self.broadcast({"type": "message", "who": who, "content": content})
-
-                # この trial の合意妥当性をチェック
-                valid = has_valid_consensus(raw_messages)
-
-                if valid:
-                    # 有効な合意が得られたので終了
-                    break
-
-                # 無効な場合、まだ再試行できるならやり直し
-                if trial < MAX_RETRIES + 1:
-                    msg = "問題が発生したため再試行します"
-                    print(msg)
-                    self.messages.append(("system", msg))
-                    self.broadcast({"type": "message", "who": "system", "content": msg})
-                    # ループして最初から会話をやり直す
-                    continue
-                else:
-                    # 再試行上限に達した場合は、そのまま終了
-                    break
-
-            # 全 trial 終了
+            # ストリーム実行（型に依存せず content があるものだけ流す）
+            async for ev in team.run_stream(task=task):
+                who = pick(ev, "source", "name", default="system")
+                content = pick(ev, "content", default=None)
+                if content:
+                    self.messages.append((who, content))
+                    self.broadcast({"type": "message", "who": who, "content": content})
             self.broadcast({"type": "__END__"})
         except Exception as e:
-            self.broadcast({"type": "message", "who": "system", "content": f"error: {e!r}"})
+            self.broadcast({"type":"message","who":"system","content":f"error: {e!r}"})
             raise
-        finally:
-            await agent_mc.close()
-            await moderator_mc.close()
+
+        await agent_mc.close()
+
 
     def get_log_markdown(self) -> str:
         lines = [

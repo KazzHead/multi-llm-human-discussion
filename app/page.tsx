@@ -9,8 +9,8 @@ const TRAVELERS = [
   { id: "traveler_D", label: "旅行者D" },
 ] as const;
 
-// const API_BASE = `http://${window.location.hostname}:8000`;
-const API_BASE = "https://multi-llm-human-discussion.onrender.com";
+const API_BASE = `http://${window.location.hostname}:8000`;
+// const API_BASE = "https://multi-llm-human-discussion.onrender.com";
 
 type RoomItem = {
   id: string;
