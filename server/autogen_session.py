@@ -172,7 +172,13 @@ class Session:
         self.model_mod_name = model_mod
         self.model_agent_name = model_agent
         self.travelers: List[str] = list(TRAVELER_ROLES)
-        initial_ai = set(ai_travelers or ["traveler_A", "traveler_C"])
+        if ai_travelers is None:
+            # 何も渡されなかったときだけデフォルト
+            initial_ai = {"traveler_A", "traveler_C"}
+        else:
+            # [] を含め、指定されたものをそのまま使う
+            initial_ai = set(ai_travelers)
+
         self.ai_travelers: set[str] = set(
             traveler for traveler in initial_ai if traveler in self.travelers
         )
